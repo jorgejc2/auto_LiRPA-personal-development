@@ -237,7 +237,7 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
                       Either be a tuple (for patches) or a 1-D tensor.
         """
 
-        def _bound_oneside(last_A, sign=-1):
+        def _bound_oneside_using_SOL_relaxations(last_A, sign=-1):
             if last_A is None:
                 return None, 0
             if sign == -1:
@@ -270,6 +270,28 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
 
             return _A, _bias
 
+        def _bound_oneside_using_optimized_relaxations(last_A, d_pos, d_neg, b_pos, b_neg):
+            if last_A is None:
+                return None, 0
+            # Obtain the new linear relaxation coefficients based on the signs in last_A.
+            same_slope = True if self.relu_options == "same-slope" else False
+            _A, _bias = multiply_by_A_signs(
+                last_A, d_pos, d_neg, b_pos, b_neg, reduce_bias=reduce_bias, same_slope=same_slope)
+            if isinstance(last_A, Patches):
+                # Save the patch size, which will be used in init_alpha() to determine the number of optimizable parameters.
+                A_prod = _A.patches
+                if start_node is not None:
+                    if last_A.unstable_idx is not None:
+                        # Sparse patches, we need to construct the full patch size: (out_c, batch, out_h, out_w, c, h, w).
+                        self.patch_size[start_node.name] = [
+                            last_A.output_shape[1], A_prod.size(1),
+                            last_A.output_shape[2], last_A.output_shape[3],
+                            A_prod.size(-3), A_prod.size(-2), A_prod.size(-1)]
+                    else:
+                        # Regular patches.
+                        self.patch_size[start_node.name] = A_prod.size()
+            return _A, _bias
+
 
         self._start = start_node.name
         if self.opt_stage not in ['opt', 'reuse']:
@@ -290,8 +312,8 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
 
 
 
-            lA, lbias = _bound_oneside(last_lA, sign=-1)
-            uA, ubias = _bound_oneside(last_uA, sign=+1)
+            lA, lbias = _bound_oneside_using_SOL_relaxations(last_lA, sign=-1)
+            uA, ubias = _bound_oneside_using_SOL_relaxations(last_uA, sign=+1)
 
             return [(lA, uA)], lbias, ubias
 
@@ -301,9 +323,19 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
         # at this point, we are performing our optimizations
         # we do not need to relax the bounds, simply clip alphas
 
-        ub_upper_d, ub_upper_b, lb_upper_d, lb_upper_b, ub_lower_d, ub_lower_b, lb_lower_d, lb_lower_b = self._get_relaxed_bounds(start_node)
+        ub_upper_d, ub_upper_b, lb_upper_d, lb_upper_b, ub_lower_d, ub_lower_b, lb_lower_d, lb_lower_b = self._get_relaxed_bounds(
+            start_node)
 
-        # return [(lA, uA)], lbias, ubias
+        uA, ubias = _bound_oneside_using_optimized_relaxations(
+            last_uA, ub_upper_d,
+            ub_lower_d,
+            ub_upper_b, ub_lower_b)
+        lA, lbias = _bound_oneside_using_optimized_relaxations(
+            last_lA, lb_lower_d,
+            lb_upper_d,
+            lb_lower_b, lb_upper_b)
+
+        return [(lA, uA)], lbias, ubias
 
 
     def dump_optimized_params(self):
@@ -486,12 +518,10 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
                                                               self.torch_general_grad_function, x.upper)
         self.ub_min_alphas = torch.min(ub_l_alphas_m, ub_r_alphas_m).squeeze()
         self.ub_max_alphas = torch.max(ub_l_alphas_m, ub_r_alphas_m).squeeze()
-        self.ub_l_intersection_points = torch.Tensor(
-            self._get_intersecting_points(self.linear_bounds[0, :, 0, 0], self.linear_bounds[0, :, 0, 1],
-                                          ub_l_alphas_m.squeeze(0), ub_l_alphas_b.squeeze(0))).permute(1,2,0)
-        self.ub_r_intersection_points = torch.Tensor(
-            self._get_intersecting_points(self.linear_bounds[0, :, 1, 0], self.linear_bounds[0, :, 1, 1],
-                                          ub_r_alphas_m.squeeze(0), ub_r_alphas_b.squeeze(0))).permute(1,2,0)
+        self.ub_l_intersection_points = self._get_intersecting_points(self.linear_bounds[0, :, 0, 0], self.linear_bounds[0, :, 0, 1],
+                                          ub_l_alphas_m.squeeze(), ub_l_alphas_b.squeeze()).permute(1, 0)
+        self.ub_r_intersection_points = self._get_intersecting_points(self.linear_bounds[0, :, 1, 0], self.linear_bounds[0, :, 1, 1],
+                                          ub_r_alphas_m.squeeze(), ub_r_alphas_b.squeeze()).permute(1, 0)
 
         # this is for the lower bounds
         lb_l_alphas_m, lb_l_alphas_b = self._get_tangent_line(self.torch_general_function,
@@ -500,12 +530,10 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
                                                               self.torch_general_grad_function, x.upper)
         self.lb_min_alphas = torch.min(lb_l_alphas_m, lb_r_alphas_m).squeeze()
         self.lb_max_alphas = torch.max(lb_l_alphas_m, lb_r_alphas_m).squeeze()
-        self.lb_l_intersection_points = torch.Tensor(
-            self._get_intersecting_points(self.linear_bounds[0, :, 0, 0], self.linear_bounds[0, :, 0, 1],
-                                          lb_l_alphas_m.squeeze(0), lb_l_alphas_b.squeeze(0))).permute(1,2,0)
-        self.lb_r_intersection_points = torch.Tensor(
-            self._get_intersecting_points(self.linear_bounds[0, :, 1, 0], self.linear_bounds[0, :, 1, 1],
-                                          lb_r_alphas_m.squeeze(0), lb_r_alphas_b.squeeze(0))).permute(1,2,0)
+        self.lb_l_intersection_points = self._get_intersecting_points(self.linear_bounds[0, :, 0, 0], self.linear_bounds[0, :, 0, 1],
+                                          lb_l_alphas_m.squeeze(), lb_l_alphas_b.squeeze()).permute(1, 0)
+        self.lb_r_intersection_points = self._get_intersecting_points(self.linear_bounds[0, :, 1, 0], self.linear_bounds[0, :, 1, 1],
+                                          lb_r_alphas_m.squeeze(), lb_r_alphas_b.squeeze()).permute(1, 0)
 
         end = time()
         if verbose: print(f"Took {end - start} seconds to curate {len(boundaries)} upper and lower bounds")
@@ -515,6 +543,16 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
         node_alpha = self.alpha[start_node.name]
         ub_upper_alphas, ub_lower_alphas, lb_upper_alphas, lb_lower_alphas = node_alpha[0,...], node_alpha[1,...], node_alpha[2,...], node_alpha[3,...]
 
+        # get the limits on alpha with appropriate dimensions
+        ub_min_alphas = self.ub_min_alphas.squeeze().expand_as(ub_upper_alphas)
+        ub_max_alphas = self.ub_max_alphas.squeeze().expand_as(ub_upper_alphas)
+        lb_min_alphas = self.lb_min_alphas.squeeze().expand_as(ub_upper_alphas)
+        lb_max_alphas = self.lb_max_alphas.squeeze().expand_as(ub_upper_alphas)
+
+        # get the slopes of the SOL bounds with appropriate dimensions
+        upper_m = self.linear_bounds[0, :, 0, 0].squeeze().expand_as(ub_upper_alphas)
+        lower_m = self.linear_bounds[0, :, 1, 0].squeeze().expand_as(ub_upper_alphas)
+
         db_pairs = []
 
         with (torch.no_grad()):
@@ -522,26 +560,23 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
             for upper_alphas in (ub_upper_alphas, lb_upper_alphas):
 
                 # clip the alphas
-                ub_min_alphas = self.ub_min_alphas.view(*[1 for _ in range(len(upper_alphas.shape) - 1)],
-                                                        upper_alphas.shape[-1]).expand(*upper_alphas.shape)
-                ub_max_alphas = self.ub_max_alphas.view(*[1 for _ in range(len(upper_alphas.shape) - 1)],
-                                                        upper_alphas.shape[-1]).expand(*upper_alphas.shape)
-
                 upper_alphas.data = torch.clip(upper_alphas, min=ub_min_alphas, max=ub_max_alphas)
 
                 # generate the masks
-                left_line_mask = upper_alphas.data <= self.linear_bounds[0, :, 0, 0]
-                right_line_mask = 1 - left_line_mask
+                left_line_mask = (upper_alphas.data <= upper_m).to(upper_alphas.dtype)
+                right_line_mask = 1. - left_line_mask
 
                 # retrieve upper_d
                 upper_d = upper_alphas
                 db_pairs.append(upper_d)
 
                 # retrieve upper_b
-                upper_b = (self.ub_l_intersection_points[:, 1] - upper_alphas * self.ub_l_intersection_points[:,
-                                                                                0]) * left_line_mask
-                + (self.ub_r_intersection_points[:, 1] - upper_alphas * self.ub_r_intersection_points[:,
-                                                                        0]) * right_line_mask
+                upper_b = (self.ub_l_intersection_points[:, 1].squeeze().expand_as(
+                    ub_upper_alphas) - upper_alphas * self.ub_l_intersection_points[:,
+                                                      0].squeeze().expand_as(ub_upper_alphas)) * left_line_mask
+                + (self.ub_r_intersection_points[:, 1].squeeze().expand_as(
+                    ub_upper_alphas) - upper_alphas * self.ub_r_intersection_points[:,
+                                                      0].squeeze().expand_as(ub_upper_alphas)) * right_line_mask
                 db_pairs.append(upper_b)
 
             for lower_alphas in (ub_lower_alphas, lb_lower_alphas):
@@ -550,23 +585,24 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
                 lower_alphas.data = torch.clip(lower_alphas, min=self.lb_min_alphas, max=self.lb_max_alphas)
 
                 # generate the masks
-                right_line_mask = lower_alphas.data <= self.linear_bounds[0, :, 1, 0]
-                left_line_mask = 1 - right_line_mask
+                right_line_mask = (lower_alphas.data <= lower_m).to(upper_alphas.dtype)
+                left_line_mask = 1. - right_line_mask
 
                 # retrieve lower_d
                 lower_d = lower_alphas
                 db_pairs.append(lower_d)
 
                 # retrieve lower_b
-                lower_b = (self.lb_l_intersection_points[:, 1] - lower_alphas * self.lb_l_intersection_points[:,
-                                                                                0]) * left_line_mask
-                + (self.lb_r_intersection_points[:, 1] - lower_alphas * self.lb_r_intersection_points[:,
-                                                                        0]) * right_line_mask
+                lower_b = (self.lb_l_intersection_points[:, 1].squeeze().expand_as(
+                    lb_upper_alphas) - lower_alphas * self.lb_l_intersection_points[:,
+                                                      0].squeeze().expand_as(ub_upper_alphas)) * left_line_mask
+                + (self.lb_r_intersection_points[:, 1].squeeze().expand_as(
+                    ub_upper_alphas) - lower_alphas * self.lb_r_intersection_points[:,
+                                                      0].squeeze().expand_as(ub_upper_alphas)) * right_line_mask
                 db_pairs.append(lower_b)
 
         assert len(db_pairs) == 8, "Not enough db pairs to unpack"
         ub_upper_d, ub_upper_b, lb_upper_d, lb_upper_b, ub_lower_d, ub_lower_b, lb_lower_d, lb_lower_b = db_pairs
-
         return ub_upper_d, ub_upper_b, lb_upper_d, lb_upper_b, ub_lower_d, ub_lower_b, lb_lower_d, lb_lower_b
 
     def _get_tangent_line(self, activation, d1, x):
@@ -578,7 +614,7 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
         :return:
         """
         y = activation(x)
-        m = d1(x)
+        m = d1(x).squeeze().expand_as(y)
         b = y - m * x
         return m, b
 
@@ -593,9 +629,6 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
         """
         x = (b2 - b1) / (m1 - m2)
         y = m1 * (b2 - b1) / (m1 - m2) + b1
-
-
-
         return torch.cat((x.unsqueeze(0), y.unsqueeze(0)), dim=0)
 
 class GeneralOptimizableActivationOp(torch.autograd.Function):
