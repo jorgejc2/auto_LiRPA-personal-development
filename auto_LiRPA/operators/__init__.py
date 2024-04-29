@@ -46,3 +46,7 @@ from .reshape import *
 from .minmax import *
 from .convex_concave import *
 from .gelu import *
+
+from .general_activations_SOL import *
+from .general_activations_SOL_bounding import *
+from .general_activations_SOL_functions import *

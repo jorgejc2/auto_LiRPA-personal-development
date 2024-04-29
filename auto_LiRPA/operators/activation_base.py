@@ -282,8 +282,12 @@ class BoundOptimizableActivation(BoundActivation):
             return As, lbias, ubias
         assert self.batch_dim == 0
 
+        # FIXME: jorgejc2 should init=False at this point? The super().bound_backward(...) method above will call
+        #  bound_relax with init=True which may make sense since at that point, opt_state may be init. Afterwards,
+        #  it will eventually be set to opt_state=opt and we reach this point where we no longer need to initialize
+        #  the bound_relax again
+        # self.bound_relax(x, init=True, dim_opt=start_shape)
         self.bound_relax(x, init=True, dim_opt=start_shape)
-
         def _bound_oneside(last_A, sign=-1):
             if last_A is None:
                 return None, 0
