@@ -11,8 +11,8 @@ from .solver_utils import grb
 from ..utils import unravel_index, prod
 from time import time
 
-from .general_activations_SOL_functions import *
-from .general_activations_SOL_bounding import OptimalLinearBounder
+from ..SOL.functions import *
+from ..SOL import OptimalLinearBounder
 
 general_function = torch_tanh
 general_grad_function = torch_tanh_grad
@@ -107,53 +107,8 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
         self.alpha_indices = None  # indices of non-zero alphas.
         verbosity = self.options.get('verbosity', 0)
 
-        # Alpha can be sparse in both spec dimension, and the C*H*W dimension.
-        # We first deal with the sparse-feature alpha, which is sparse in the
-        # C*H*W dimesnion of this layer.
-        minimum_sparsity = self.options.get('minimum_sparsity', 0.9)
-        if (self.use_sparse_features_alpha
-                and self.inputs[0].is_lower_bound_current()
-                and self.inputs[0].is_upper_bound_current()):
-            # Pre-activation bounds available, we will store the alpha for unstable neurons only.
-            # Since each element in a batch can have different unstable neurons,
-            # for simplicity we find a super-set using any(dim=0).
-            # This can be non-ideal if the x in a batch are very different.
-            self.get_unstable_idx()
-            total_neuron_size = self.inputs[0].lower.numel() // batch_size
-            if self.alpha_indices[0].size(0) <= minimum_sparsity * total_neuron_size:
-                # Shape is the number of unstable neurons in this layer.
-                alpha_shape = [self.alpha_indices[0].size(0)]
-                # Skip the batch, spec dimension, and find the lower slopes for all unstable neurons.
-                if len(self.alpha_indices) == 1:
-                    # This layer is after a linear layer.
-                    alpha_init = self.init_d[:, :, self.alpha_indices[0]]
-                elif len(self.alpha_indices) == 3:
-                    # This layer is after a conv2d layer.
-                    alpha_init = self.init_d[
-                        :, :, self.alpha_indices[0], self.alpha_indices[1],
-                        self.alpha_indices[2]]
-                elif len(self.alpha_indices) == 2:
-                    # This layer is after a conv1d layer.
-                    alpha_init = self.init_d[
-                                 :, :, self.alpha_indices[0], self.alpha_indices[1]]
-                else:
-                    raise ValueError
-                if verbosity > 0:
-                    print(f'layer {self.name} using sparse-features alpha with shape {alpha_shape}; unstable size '
-                          f'{self.alpha_indices[0].size(0)}; total size {total_neuron_size} ({list(ref.shape)})')
-            else:
-                alpha_shape = self.shape  # Full alpha.
-                alpha_init = self.init_d
-                if verbosity > 0:
-                    print(f'layer {self.name} using full alpha with shape {alpha_shape}; unstable size '
-                          f'{self.alpha_indices[0].size(0)}; total size {total_neuron_size} ({list(ref.shape)})')
-                self.alpha_indices = None  # Use full alpha.
-        else:
-            alpha_shape = self.shape  # Full alpha.
-            # alpha_init = self.init_d
+        alpha_shape = self.shape  # Full alpha.
         # Now we start to create alphas for all start nodes.
-        # When sparse-spec feature is enabled, alpha is created for only
-        # unstable neurons in start node.
         for start_node in start_nodes:
             ns, output_shape, unstable_idx = start_node[:3]
             if isinstance(output_shape, (list, tuple)):
@@ -163,58 +118,20 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
                     size_s = output_shape[0]
             else:
                 size_s = output_shape
-            # unstable_idx may be a tensor (dense layer or conv layer
-            # with shared alpha), or tuple of 3-d tensors (conv layer with
-            # non-sharing alpha).
-            sparsity = float('inf') if unstable_idx is None else unstable_idx.size(0) if isinstance(unstable_idx, torch.Tensor) else unstable_idx[0].size(0)
-            if sparsity <= minimum_sparsity * size_s and self.use_sparse_spec_alpha:
-                # For fully connected layer, or conv layer with shared alpha per channel.
-                # shape is (2, sparse_spec, batch, this_layer_shape)
-                # We create sparse specification dimension, where the spec dimension of alpha only includes slopes for unstable neurons in start_node.
-                self.alpha[ns] = torch.empty([self.alpha_size, sparsity + 1, batch_size, *alpha_shape],
-                                             dtype=torch.float, device=ref.device, requires_grad=True)
-                self.alpha[ns].data.copy_(alpha_init.data)  # This will broadcast to (2, sparse_spec) dimensions.
-                if verbosity > 0:
-                    print(f'layer {self.name} start_node {ns} using sparse-spec alpha {list(self.alpha[ns].size())}'
-                          f' with unstable size {sparsity} total_size {size_s} output_shape {output_shape}')
-                # unstable_idx is a list of used neurons (or channels for BoundConv) for the start_node.
-                assert unstable_idx.ndim == 1 if isinstance(unstable_idx, torch.Tensor) else unstable_idx[0].ndim == 1
-                # We only need to the alpha for the unstable neurons in start_node.
-                indices = torch.arange(1, sparsity + 1, device=alpha_init.device, dtype=torch.long)
-                if isinstance(output_shape, int) or len(output_shape) == 1:
-                    # Fully connected layers, or conv layer in patches mode with partially shared alpha (pixels in the same channel use the same alpha).
-                    self.alpha_lookup_idx[ns] = torch.zeros(size_s, dtype=torch.long, device=alpha_init.device)
-                    # This lookup table maps the unstable_idx to the actual alpha location in self.alpha[ns].
-                    # Note that self.alpha[ns][:,0] is reserved for any unstable neurons that are not found in the lookup table. This usually should not
-                    # happen, unless reference bounds are not properly set.
-                    self.alpha_lookup_idx[ns].data[unstable_idx] = indices
-                else:
-                    # conv layer in matrix mode, or in patches mode but with non-shared alpha. The lookup table is 3-d.
-                    assert len(output_shape) == 3
-                    self.alpha_lookup_idx[ns] = torch.zeros(output_shape, dtype=torch.long, device=alpha_init.device)
-                    if isinstance(unstable_idx, torch.Tensor):
-                        # Convert the unstable index from flattend 1-d to 3-d. (matrix mode).
-                        unstable_idx_3d = unravel_index(unstable_idx, output_shape)
-                    else:
-                        # Patches mode with non-shared alpha, unstable_idx is already 3d.
-                        unstable_idx_3d = unstable_idx
-                    # Build look-up table.
-                    self.alpha_lookup_idx[ns].data[unstable_idx_3d[0], unstable_idx_3d[1], unstable_idx_3d[2]] = indices
-            else:
-                # alpha shape is (2, spec, batch, this_layer_shape). "this_layer_shape" may still be sparse.
-                self.alpha[ns] = torch.empty([self.alpha_size, size_s, batch_size, *alpha_shape],
-                                             dtype=torch.float, device=ref.device, requires_grad=True)
-                # self.alpha[ns].data.copy_(alpha_init.data)  # This will broadcast to (2, spec) dimensions
-                # initialize alphas to be the SOL slopes
-                self.alpha[ns].data[0,...].copy_(self.linear_bounds[0,:,0,0])
-                self.alpha[ns].data[2, ...].copy_(self.linear_bounds[0, :, 0, 0])
-                self.alpha[ns].data[1, ...].copy_(self.linear_bounds[0, :, 1, 0])
-                self.alpha[ns].data[3, ...].copy_(self.linear_bounds[0, :, 1, 0])
-                if verbosity > 0:
-                    print(f'layer {self.name} start_node {ns} using full alpha {list(self.alpha[ns].size())} with unstable '
-                          f'size {sparsity if unstable_idx is not None else None} total_size {size_s} output_shape {output_shape}')
-                # alpha_lookup_idx can be used for checking if sparse alpha is used or not.
-                self.alpha_lookup_idx[ns] = None
+
+            # alpha shape is (2, spec, batch, this_layer_shape). "this_layer_shape" may still be sparse.
+            self.alpha[ns] = torch.empty([self.alpha_size, size_s, batch_size, *alpha_shape],
+                                         dtype=torch.float, device=ref.device, requires_grad=True)
+            # initialize alphas to be the SOL slopes
+            self.alpha[ns].data[0, ...].copy_(self.linear_bounds[0, :, 0, 0])
+            self.alpha[ns].data[2, ...].copy_(self.linear_bounds[0, :, 0, 0])
+            self.alpha[ns].data[1, ...].copy_(self.linear_bounds[0, :, 1, 0])
+            self.alpha[ns].data[3, ...].copy_(self.linear_bounds[0, :, 1, 0])
+            if verbosity > 0:
+                print(f'layer {self.name} start_node {ns} using full alpha {list(self.alpha[ns].size())} with unstable '
+                      f'size {None} total_size {size_s} output_shape {output_shape}')
+            # alpha_lookup_idx can be used for checking if sparse alpha is used or not.
+            self.alpha_lookup_idx[ns] = None
 
     def select_alpha_by_idx(self, last_lA, last_uA, unstable_idx, start_node, alpha_lookup_idx):
         """
@@ -488,7 +405,10 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
 
         pass
 
-    def _get_optimal_SOL_bounds(self, x, verbose=True):
+    def _get_optimal_SOL_bounds(self, x: torch.Tensor, use_tangent=False) -> None:
+
+        verbosity = self.options.get('verbosity', 0)
+
         # init relaxation arrays
         self.init_linear_relaxation(x)
 
@@ -505,17 +425,40 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
         boundaries = torch.cat((Lower, Upper), dim=2)
         boundaries = boundaries.squeeze().numpy()
         start = time()
+        upper_branched_points = np.zeros(len(boundaries))
+        lower_branched_points = np.zeros(len(boundaries))
         for i, boundary in enumerate(boundaries):
             boundary = np.expand_dims(boundary, axis=0)
-            lower_bound, upper_bound = bounder.find_optimal_bounds(boundary)
+            lower_bound, lower_branched_point, upper_bound, upper_branched_point = bounder.find_optimal_bounds(boundary,
+                                                                                                               verbosity=verbosity,
+                                                                                                               get_most_branched=not use_tangent)
+            if not use_tangent:
+                upper_branched_points[i] = upper_branched_point
+                lower_branched_points[i] = lower_branched_point
             self.linear_bounds[0, i, 0, :] = torch.from_numpy(upper_bound).to(self.linear_bounds.device)
             self.linear_bounds[0, i, 1, :] = torch.from_numpy(lower_bound).to(self.linear_bounds.device)
 
         # this is for the upper bounds
-        ub_l_alphas_m, ub_l_alphas_b = self._get_tangent_line(self.torch_general_function,
-                                                              self.torch_general_grad_function, x.lower)
-        ub_r_alphas_m, ub_r_alphas_b = self._get_tangent_line(self.torch_general_function,
-                                                              self.torch_general_grad_function, x.upper)
+        if use_tangent:
+            ub_l_alphas_m, ub_l_alphas_b = self._get_tangent_line(self.torch_general_function,
+                                                                  self.torch_general_grad_function, x.lower)
+            ub_r_alphas_m, ub_r_alphas_b = self._get_tangent_line(self.torch_general_function,
+                                                                  self.torch_general_grad_function, x.upper)
+        else:
+            ub_l_alphas_m = torch.zeros_like(x.lower)
+            ub_l_alphas_b = torch.zeros_like(x.lower)
+            ub_r_alphas_m = torch.zeros_like(x.lower)
+            ub_r_alphas_b = torch.zeros_like(x.lower)
+            for i, boundary in enumerate(boundaries):
+                upper_branched_point = upper_branched_points[i]
+                _, _, (ub_l_alphas_m[0, i], ub_l_alphas_b[0, i]), _ = bounder.find_optimal_bounds(
+                    np.array([[boundary[0], upper_branched_point]]), verbosity=verbosity, get_most_branched=False,
+                    lower=False)
+                _, _, (ub_r_alphas_m[0, i], ub_r_alphas_b[0, i]), _ = bounder.find_optimal_bounds(
+                    np.array([[upper_branched_point, boundary[1]]]), verbosity=verbosity, get_most_branched=False,
+                    lower=False)
+
+
         self.ub_min_alphas = torch.min(ub_l_alphas_m, ub_r_alphas_m).squeeze()
         self.ub_max_alphas = torch.max(ub_l_alphas_m, ub_r_alphas_m).squeeze()
         self.ub_l_intersection_points = self._get_intersecting_points(self.linear_bounds[0, :, 0, 0], self.linear_bounds[0, :, 0, 1],
@@ -524,10 +467,25 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
                                           ub_r_alphas_m.squeeze(), ub_r_alphas_b.squeeze()).permute(1, 0)
 
         # this is for the lower bounds
-        lb_l_alphas_m, lb_l_alphas_b = self._get_tangent_line(self.torch_general_function,
-                                                              self.torch_general_grad_function, x.lower)
-        lb_r_alphas_m, lb_r_alphas_b = self._get_tangent_line(self.torch_general_function,
-                                                              self.torch_general_grad_function, x.upper)
+        if use_tangent:
+            lb_l_alphas_m, lb_l_alphas_b = self._get_tangent_line(self.torch_general_function,
+                                                                  self.torch_general_grad_function, x.lower)
+            lb_r_alphas_m, lb_r_alphas_b = self._get_tangent_line(self.torch_general_function,
+                                                                  self.torch_general_grad_function, x.upper)
+        else:
+            lb_l_alphas_m = torch.zeros_like(x.lower)
+            lb_l_alphas_b = torch.zeros_like(x.lower)
+            lb_r_alphas_m = torch.zeros_like(x.lower)
+            lb_r_alphas_b = torch.zeros_like(x.lower)
+            for i, boundary in enumerate(boundaries):
+                lower_branched_point = lower_branched_points[i]
+                (lb_l_alphas_m[0, i], lb_l_alphas_b[0, i]), _, _, _ = bounder.find_optimal_bounds(
+                    np.array([[boundary[0], lower_branched_point]]), verbosity=verbosity, get_most_branched=False,
+                    upper=False)
+                (lb_r_alphas_m[0, i], lb_r_alphas_b[0, i]), _, _, _ = bounder.find_optimal_bounds(
+                    np.array([[lower_branched_point, boundary[1]]]), verbosity=verbosity, get_most_branched=False,
+                    upper=False)
+
         self.lb_min_alphas = torch.min(lb_l_alphas_m, lb_r_alphas_m).squeeze()
         self.lb_max_alphas = torch.max(lb_l_alphas_m, lb_r_alphas_m).squeeze()
         self.lb_l_intersection_points = self._get_intersecting_points(self.linear_bounds[0, :, 0, 0], self.linear_bounds[0, :, 0, 1],
@@ -535,13 +493,26 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
         self.lb_r_intersection_points = self._get_intersecting_points(self.linear_bounds[0, :, 1, 0], self.linear_bounds[0, :, 1, 1],
                                           lb_r_alphas_m.squeeze(), lb_r_alphas_b.squeeze()).permute(1, 0)
 
+        # check which alphas are optimizable
+        self.alpha_is_optimizable = torch.zeros(self.alpha_size, *self.shape, dtype=torch.float)
+        self.alpha_is_optimizable[0] = (ub_r_alphas_m < self.linear_bounds[0, :, 0, 0] < ub_l_alphas_m).to(dtype=torch.float)
+        self.alpha_is_optimizable[2] = (lb_r_alphas_m < self.linear_bounds[0, :, 0, 0] < lb_l_alphas_m).to(dtype=torch.float)
+        self.alpha_is_optimizable[1] = (ub_l_alphas_m < self.linear_bounds[0, :, 1, 0] < ub_r_alphas_m).to(dtype=torch.float)
+        self.alpha_is_optimizable[3] = (lb_l_alphas_m < self.linear_bounds[0, :, 1, 0] < lb_r_alphas_m).to(dtype=torch.float)
+
         end = time()
-        if verbose: print(f"Took {end - start} seconds to curate {len(boundaries)} upper and lower bounds")
+        if verbosity: print(f"Took {end - start} seconds to curate {len(boundaries)} upper and lower bounds")
 
-
-    def _get_relaxed_bounds(self, start_node):
+    def _get_relaxed_bounds(self, start_node: str) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Gets the relaxed bounds using alphas
+        :param start_node:
+        :return:
+        """
         node_alpha = self.alpha[start_node.name]
-        ub_upper_alphas, ub_lower_alphas, lb_upper_alphas, lb_lower_alphas = node_alpha[0,...], node_alpha[1,...], node_alpha[2,...], node_alpha[3,...]
+        ub_upper_alphas, ub_lower_alphas, lb_upper_alphas, lb_lower_alphas = node_alpha[0, ...], node_alpha[1, ...], \
+        node_alpha[2, ...], node_alpha[3, ...]
 
         # get the limits on alpha with appropriate dimensions
         ub_min_alphas = self.ub_min_alphas.squeeze().expand_as(ub_upper_alphas)
@@ -555,51 +526,53 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
 
         db_pairs = []
 
-        with (torch.no_grad()):
+        for upper_alphas, optimizable_elements in zip((ub_upper_alphas, lb_upper_alphas), (self.alpha_is_optimizable[0], self.alpha_is_optimizable[2])):
 
-            for upper_alphas in (ub_upper_alphas, lb_upper_alphas):
-
-                # clip the alphas
+            # clip the alphas
+            with (torch.no_grad()):
                 upper_alphas.data = torch.clip(upper_alphas, min=ub_min_alphas, max=ub_max_alphas)
 
-                # generate the masks
-                left_line_mask = (upper_alphas.data <= upper_m).to(upper_alphas.dtype)
-                right_line_mask = 1. - left_line_mask
+            # generate the masks
+            left_line_mask = (upper_alphas.data <= upper_m).to(upper_alphas.dtype)
+            right_line_mask = 1. - left_line_mask
 
-                # retrieve upper_d
-                upper_d = upper_alphas
-                db_pairs.append(upper_d)
+            # retrieve upper_d
+            upper_d = upper_alphas
+            db_pairs.append(upper_d)
 
-                # retrieve upper_b
-                upper_b = (self.ub_l_intersection_points[:, 1].squeeze().expand_as(
-                    ub_upper_alphas) - upper_alphas * self.ub_l_intersection_points[:,
-                                                      0].squeeze().expand_as(ub_upper_alphas)) * left_line_mask
-                + (self.ub_r_intersection_points[:, 1].squeeze().expand_as(
-                    ub_upper_alphas) - upper_alphas * self.ub_r_intersection_points[:,
-                                                      0].squeeze().expand_as(ub_upper_alphas)) * right_line_mask
-                db_pairs.append(upper_b)
+            # retrieve upper_b
+            upper_b = (self.ub_l_intersection_points[:, 1].squeeze().expand_as(
+                ub_upper_alphas) - upper_alphas * self.ub_l_intersection_points[:,
+                                                  0].squeeze().expand_as(ub_upper_alphas)) * left_line_mask
+            + (self.ub_r_intersection_points[:, 1].squeeze().expand_as(
+                ub_upper_alphas) - upper_alphas * self.ub_r_intersection_points[:,
+                                                  0].squeeze().expand_as(ub_upper_alphas)) * right_line_mask
+            upper_b *= optimizable_elements
+            db_pairs.append(upper_b)
 
-            for lower_alphas in (ub_lower_alphas, lb_lower_alphas):
+        for lower_alphas, optimizable_elements in zip((ub_lower_alphas, lb_lower_alphas), (self.alpha_is_optimizable[1], self.alpha_is_optimizable[3])):
 
-                # clip the alphas
-                lower_alphas.data = torch.clip(lower_alphas, min=self.lb_min_alphas, max=self.lb_max_alphas)
+            # clip the alphas
+            with (torch.no_grad()):
+                lower_alphas.data = torch.clip(lower_alphas, min=lb_min_alphas, max=lb_max_alphas)
 
-                # generate the masks
-                right_line_mask = (lower_alphas.data <= lower_m).to(upper_alphas.dtype)
-                left_line_mask = 1. - right_line_mask
+            # generate the masks
+            right_line_mask = (lower_alphas.data <= lower_m).to(upper_alphas.dtype)
+            left_line_mask = 1. - right_line_mask
 
-                # retrieve lower_d
-                lower_d = lower_alphas
-                db_pairs.append(lower_d)
+            # retrieve lower_d
+            lower_d = lower_alphas
+            db_pairs.append(lower_d)
 
-                # retrieve lower_b
-                lower_b = (self.lb_l_intersection_points[:, 1].squeeze().expand_as(
-                    lb_upper_alphas) - lower_alphas * self.lb_l_intersection_points[:,
-                                                      0].squeeze().expand_as(ub_upper_alphas)) * left_line_mask
-                + (self.lb_r_intersection_points[:, 1].squeeze().expand_as(
-                    ub_upper_alphas) - lower_alphas * self.lb_r_intersection_points[:,
-                                                      0].squeeze().expand_as(ub_upper_alphas)) * right_line_mask
-                db_pairs.append(lower_b)
+            # retrieve lower_b
+            lower_b = (self.lb_l_intersection_points[:, 1].squeeze().expand_as(
+                lb_upper_alphas) - lower_alphas * self.lb_l_intersection_points[:,
+                                                  0].squeeze().expand_as(ub_upper_alphas)) * left_line_mask
+            + (self.lb_r_intersection_points[:, 1].squeeze().expand_as(
+                ub_upper_alphas) - lower_alphas * self.lb_r_intersection_points[:,
+                                                  0].squeeze().expand_as(ub_upper_alphas)) * right_line_mask
+            lower_b *= optimizable_elements
+            db_pairs.append(lower_b)
 
         assert len(db_pairs) == 8, "Not enough db pairs to unpack"
         ub_upper_d, ub_upper_b, lb_upper_d, lb_upper_b, ub_lower_d, ub_lower_b, lb_lower_d, lb_lower_b = db_pairs
