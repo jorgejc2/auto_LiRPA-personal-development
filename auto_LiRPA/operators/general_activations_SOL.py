@@ -495,14 +495,34 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
 
         # check which alphas are optimizable
         self.alpha_is_optimizable = torch.zeros(self.alpha_size, *self.shape, dtype=torch.float)
-        self.alpha_is_optimizable[0] = (ub_r_alphas_m < self.linear_bounds[0, :, 0, 0] < ub_l_alphas_m).to(dtype=torch.float)
-        self.alpha_is_optimizable[2] = (lb_r_alphas_m < self.linear_bounds[0, :, 0, 0] < lb_l_alphas_m).to(dtype=torch.float)
-        self.alpha_is_optimizable[1] = (ub_l_alphas_m < self.linear_bounds[0, :, 1, 0] < ub_r_alphas_m).to(dtype=torch.float)
-        self.alpha_is_optimizable[3] = (lb_l_alphas_m < self.linear_bounds[0, :, 1, 0] < lb_r_alphas_m).to(dtype=torch.float)
+        self.alpha_is_optimizable[0] = torch.logical_and(ub_r_alphas_m < self.linear_bounds[0, :, 0, 0].unsqueeze(0),
+                                                         self.linear_bounds[0, :, 0, 0].unsqueeze(
+                                                             0) < ub_l_alphas_m).to(
+            dtype=self.alpha_is_optimizable.dtype)
+        self.alpha_is_optimizable[2] = torch.logical_and(lb_r_alphas_m < self.linear_bounds[0, :, 0, 0].unsqueeze(0),
+                                                         self.linear_bounds[0, :, 0, 0].unsqueeze(
+                                                             0) < lb_l_alphas_m).to(
+            dtype=self.alpha_is_optimizable.dtype)
+        self.alpha_is_optimizable[1] = torch.logical_and(ub_l_alphas_m < self.linear_bounds[0, :, 1, 0].unsqueeze(0),
+                                                         self.linear_bounds[0, :, 1, 0].unsqueeze(
+                                                             0) < ub_r_alphas_m).to(
+            dtype=self.alpha_is_optimizable.dtype)
+        self.alpha_is_optimizable[3] = torch.logical_and(lb_l_alphas_m < self.linear_bounds[0, :, 1, 0].unsqueeze(0),
+                                                         self.linear_bounds[0, :, 1, 0].unsqueeze(
+                                                             0) < lb_r_alphas_m).to(
+            dtype=self.alpha_is_optimizable.dtype)
 
         end = time()
-        if verbosity: print(f"Took {end - start} seconds to curate {len(boundaries)} upper and lower bounds")
-
+        if verbosity:
+            print(f"Took {end - start} seconds to curate {len(boundaries)} upper and lower bounds")
+            margins = torch.zeros_like(self.alpha_is_optimizable)
+            i = 0
+            for alpha_is_optimizable, low_margin, high_margin in zip([self.alpha_is_optimizable[i] for i in range(4)], (ub_r_alphas_m, ub_l_alphas_m, lb_r_alphas_m, lb_l_alphas_m), (ub_l_alphas_m, ub_r_alphas_m, lb_l_alphas_m, lb_r_alphas_m)):
+                assert high_margin.shape == low_margin.shape, "Margins should have the same shape"
+                curr_margin = (high_margin - low_margin) * alpha_is_optimizable
+                assert torch.all(curr_margin >= 0), "Margins should have nonnegative width"
+                margins[i] = curr_margin
+            print(f"Margins (shape {margins.shape}): \n {margins.detach().cpu().numpy()}")
     def _get_relaxed_bounds(self, start_node: str) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -528,9 +548,13 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
 
         for upper_alphas, optimizable_elements in zip((ub_upper_alphas, lb_upper_alphas), (self.alpha_is_optimizable[0], self.alpha_is_optimizable[2])):
 
+            not_optimizable_elements = 1. - optimizable_elements
+
             # clip the alphas
             with (torch.no_grad()):
-                upper_alphas.data = torch.clip(upper_alphas, min=ub_min_alphas, max=ub_max_alphas)
+                upper_alphas.data = torch.clip(upper_alphas, min=ub_min_alphas,
+                                               max=ub_max_alphas) * optimizable_elements + (
+                                        upper_m) * not_optimizable_elements
 
             # generate the masks
             left_line_mask = (upper_alphas.data <= upper_m).to(upper_alphas.dtype)
@@ -547,14 +571,17 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
             + (self.ub_r_intersection_points[:, 1].squeeze().expand_as(
                 ub_upper_alphas) - upper_alphas * self.ub_r_intersection_points[:,
                                                   0].squeeze().expand_as(ub_upper_alphas)) * right_line_mask
-            upper_b *= optimizable_elements
             db_pairs.append(upper_b)
 
         for lower_alphas, optimizable_elements in zip((ub_lower_alphas, lb_lower_alphas), (self.alpha_is_optimizable[1], self.alpha_is_optimizable[3])):
 
+            not_optimizable_elements = 1. - optimizable_elements
+
             # clip the alphas
             with (torch.no_grad()):
-                lower_alphas.data = torch.clip(lower_alphas, min=lb_min_alphas, max=lb_max_alphas)
+                lower_alphas.data = torch.clip(lower_alphas, min=lb_min_alphas,
+                                               max=lb_max_alphas) * optimizable_elements + (
+                                        lower_m) * not_optimizable_elements
 
             # generate the masks
             right_line_mask = (lower_alphas.data <= lower_m).to(upper_alphas.dtype)
@@ -571,7 +598,6 @@ class BoundGeneralActivationsSOL(BoundOptimizableActivation):
             + (self.lb_r_intersection_points[:, 1].squeeze().expand_as(
                 ub_upper_alphas) - lower_alphas * self.lb_r_intersection_points[:,
                                                   0].squeeze().expand_as(ub_upper_alphas)) * right_line_mask
-            lower_b *= optimizable_elements
             db_pairs.append(lower_b)
 
         assert len(db_pairs) == 8, "Not enough db pairs to unpack"
